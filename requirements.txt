@@ -1,0 +1,15 @@
+python-dotenv
+requests
+openai>=1.0.0
+speechrecognition
+pyttsx3
+gTTS
+playsound==1.2.2
+numpy
+opencv-contrib-python
+mediapipe
+edge-tts
+pyautogui
+pillow
+websockets
+pygame

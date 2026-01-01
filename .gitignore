@@ -1,0 +1,14 @@
+.env
+*.db
+data/*.db
+*.mp3
+temp_*.mp3
+respuesta.mp3
+__pycache__/
+**/__pycache__/
+.history/
+.vscode/
+.venv/
+venv_yui/
+known_faces/
+models/
