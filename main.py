@@ -122,6 +122,10 @@ class YUI:
         self._last_voice_ack_ts = 0.0
         self._scan_lock = threading.Lock()
         self._scan_thread: Optional[threading.Thread] = None
+        self._auto_analysis_lock = threading.Lock()
+        self._auto_analysis_thread: Optional[threading.Thread] = None
+        self._auto_analysis_cancel = threading.Event()
+        self._auto_analysis_profile = ""
 
         self._init_runtime_profile()
 
@@ -729,6 +733,46 @@ class YUI:
                     pass
             return f"Entorno: {summarize_profile(prof)}. tier={self._tuning_tier}."
 
+        # System audit (read-only, via PowerShell).
+        if any(
+            k in low
+            for k in [
+                "auditoria sistema",
+                "auditoría sistema",
+                "auditoria del sistema",
+                "auditoria pc",
+                "autodiagnostico sistema",
+                "autodiagnóstico sistema",
+            ]
+        ):
+            try:
+                from desktop.security_audit import system_audit
+
+                rep = system_audit()
+                if rep.detail:
+                    print(rep.detail)
+                return rep.voice
+            except Exception:
+                return "No pude correr la auditoría del sistema ahora mismo."
+
+        # Auto-analysis (runs a bundle of read-only audits in background).
+        if low.startswith(("autoanalisis", "auto análisis", "auto analisis", "autodiagnostico", "autodiagnóstico", "auto diagnostico")):
+            if any(k in low for k in ["estado", "status"]):
+                return self._auto_analysis_status()
+            if any(k in low for k in ["cancela", "cancelar", "deten", "detener", "stop"]):
+                return self._cancel_auto_analysis()
+
+            prof = "rapido"
+            if any(k in low for k in ["completo", "full", "todo"]):
+                prof = "completo"
+            elif any(k in low for k in ["seguridad", "defensa", "defensivo"]):
+                prof = "seguridad"
+            elif any(k in low for k in ["navegador", "browser", "cookies", "extensiones"]):
+                prof = "navegador"
+            elif any(k in low for k in ["sistema", "pc", "rendimiento"]):
+                prof = "rapido"
+            return self._start_auto_analysis(prof)
+
         # Security quick audit (Windows Defender / Firewall).
         if any(k in low for k in ["auditoria seguridad", "auditoría seguridad", "revisa seguridad", "chequea seguridad", "seguridad audit"]):
             try:
@@ -875,6 +919,113 @@ class YUI:
             if not self._stop.is_set():
                 self.voice.speak("Tuve un problema ejecutando el escaneo.")
             print(f"[YUI] Malware scan error: {type(e).__name__}: {e}")
+
+    def _auto_analysis_status(self) -> str:
+        with self._auto_analysis_lock:
+            running = bool(self._auto_analysis_thread and self._auto_analysis_thread.is_alive())
+            prof = (self._auto_analysis_profile or "").strip() or "rapido"
+        return "Autoanalisis: " + ("activo" if running else "apagado") + f" (perfil '{prof}')."
+
+    def _cancel_auto_analysis(self) -> str:
+        with self._auto_analysis_lock:
+            running = bool(self._auto_analysis_thread and self._auto_analysis_thread.is_alive())
+            if not running:
+                return "No estoy haciendo un autoanalisis ahora."
+            self._auto_analysis_cancel.set()
+        return "Ok. Cancelo el resto del autoanalisis (puede tardar unos segundos)."
+
+    def _start_auto_analysis(self, profile: str) -> str:
+        prof = (profile or "").strip().lower() or "rapido"
+        with self._auto_analysis_lock:
+            if self._auto_analysis_thread is not None and self._auto_analysis_thread.is_alive():
+                cur = (self._auto_analysis_profile or "").strip() or "rapido"
+                return f"Ya estoy haciendo un autoanalisis (perfil '{cur}')."
+            self._auto_analysis_cancel.clear()
+            self._auto_analysis_profile = prof
+            self._auto_analysis_thread = threading.Thread(
+                target=self._auto_analysis_worker,
+                args=(prof,),
+                daemon=True,
+                name="yui-auto-analysis",
+            )
+            self._auto_analysis_thread.start()
+        return f"Listo. Inicio autoanalisis (perfil '{prof}'). Te aviso al terminar."
+
+    def _auto_analysis_worker(self, profile: str) -> None:
+        prof = (profile or "").strip().lower() or "rapido"
+        speak_end = os.getenv("YUI_AUTO_ANALYSIS_SPEAK", "1") not in {"0", "false", "False"}
+        print_detail = os.getenv("YUI_AUTO_ANALYSIS_PRINT", "1") not in {"0", "false", "False"}
+
+        try:
+            self.ui_bus.publish("analysis", {"state": "start", "profile": prof})
+        except Exception:
+            pass
+
+        def _step(name: str, fn):  # noqa: ANN001
+            if self._stop.is_set() or self._auto_analysis_cancel.is_set():
+                return None
+            try:
+                rep = fn()
+            except Exception as e:
+                print(f"[YUI] Autoanálisis '{name}' error: {type(e).__name__}: {e}")
+                return None
+            if getattr(rep, "detail", "") and print_detail:
+                print("\n" + str(rep.detail).strip())
+            return getattr(rep, "voice", None)
+
+        steps = []
+        try:
+            from desktop.security_audit import cookies_audit, extensions_audit, ports_audit, processes_audit, quick_audit, system_audit
+
+            if prof in {"rapido", "rápido", "sistema", "pc", "rendimiento"}:
+                steps = [("sistema", system_audit), ("seguridad", quick_audit)]
+            elif prof in {"seguridad", "defensa", "defensivo"}:
+                steps = [("seguridad", quick_audit), ("procesos", processes_audit), ("puertos", ports_audit)]
+            elif prof in {"navegador", "browser", "cookies", "extensiones"}:
+                steps = [("extensiones", extensions_audit), ("cookies", cookies_audit)]
+            elif prof in {"completo", "full", "todo"}:
+                steps = [
+                    ("sistema", system_audit),
+                    ("seguridad", quick_audit),
+                    ("procesos", processes_audit),
+                    ("puertos", ports_audit),
+                    ("extensiones", extensions_audit),
+                    ("cookies", cookies_audit),
+                ]
+            else:
+                steps = [("sistema", system_audit), ("seguridad", quick_audit)]
+        except Exception:
+            steps = []
+
+        print(f"[YUI] Autoanalisis iniciado (perfil '{prof}').")
+        voices: list[str] = []
+        for name, fn in steps:
+            if self._stop.is_set() or self._auto_analysis_cancel.is_set():
+                break
+            v = _step(name, fn)
+            if isinstance(v, str) and v.strip():
+                voices.append(v.strip())
+            try:
+                self.ui_bus.publish("analysis", {"state": "step", "profile": prof, "step": name})
+            except Exception:
+                pass
+
+        canceled = self._auto_analysis_cancel.is_set()
+        if canceled:
+            msg = "Ok. Cancele el autoanalisis."
+        else:
+            msg = "Listo. Termine el autoanalisis."
+
+        try:
+            self.ui_bus.publish("analysis", {"state": "done", "profile": prof, "canceled": canceled})
+        except Exception:
+            pass
+
+        if speak_end and not self._stop.is_set():
+            try:
+                self._speak(msg)
+            except Exception:
+                pass
 
     def _handle_task_commands(self, text: str) -> Optional[str]:
         t = (text or "").strip()

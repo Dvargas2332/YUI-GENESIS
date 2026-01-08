@@ -117,6 +117,118 @@ def quick_audit() -> SecurityAudit:
     return SecurityAudit(voice=voice, detail=detail)
 
 
+def system_audit() -> SecurityAudit:
+    """
+    Lightweight system snapshot (read-only):
+    - OS / boot time
+    - CPU
+    - RAM usage (approx)
+    - Filesystem drives (free/total)
+    - Top processes by CPU time
+    """
+    if not _is_windows():
+        return SecurityAudit(voice="La auditoría del sistema solo está disponible en Windows.")
+
+    os_info = _run_powershell_json(
+        "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,OSArchitecture,LastBootUpTime,TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json -Compress",
+        timeout_s=12.0,
+    )
+    cpu_info = _run_powershell_json(
+        "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed | ConvertTo-Json -Compress",
+        timeout_s=12.0,
+    )
+    drives = _run_powershell_json(
+        "Get-PSDrive -PSProvider FileSystem | Select-Object Name,Used,Free | ConvertTo-Json -Compress",
+        timeout_s=12.0,
+    )
+    procs = _run_powershell_json(
+        "Get-Process | Sort-Object CPU -Descending | Select-Object -First 8 ProcessName,Id,CPU,WorkingSet | ConvertTo-Json -Compress",
+        timeout_s=12.0,
+    )
+
+    lines: list[str] = []
+    lines.append("[Sistema]")
+
+    if isinstance(os_info, dict):
+        caption = str(os_info.get("Caption") or "").strip()
+        version = str(os_info.get("Version") or "").strip()
+        arch = str(os_info.get("OSArchitecture") or "").strip()
+        boot = str(os_info.get("LastBootUpTime") or "").strip()
+        if caption or version or arch:
+            lines.append(f"- OS: {(caption or 'Windows').strip()} {version} ({arch})".strip())
+        if boot:
+            lines.append(f"- Boot: {boot}")
+
+        try:
+            total_kb = float(os_info.get("TotalVisibleMemorySize") or 0.0)
+            free_kb = float(os_info.get("FreePhysicalMemory") or 0.0)
+            if total_kb > 0:
+                used_kb = max(0.0, total_kb - free_kb)
+                used_pct = (used_kb / total_kb) * 100.0
+                lines.append(f"- RAM: {used_pct:.0f}% usada (~{used_kb/1024/1024:.1f} GB / {total_kb/1024/1024:.1f} GB)")
+        except Exception:
+            pass
+    else:
+        lines.append("- OS: no disponible")
+
+    if isinstance(cpu_info, dict):
+        cpu_info = [cpu_info]
+    if isinstance(cpu_info, list) and cpu_info:
+        c0 = cpu_info[0] if isinstance(cpu_info[0], dict) else {}
+        name = str(c0.get("Name") or "").strip()
+        cores = c0.get("NumberOfCores")
+        threads = c0.get("NumberOfLogicalProcessors")
+        mhz = c0.get("MaxClockSpeed")
+        bits = [b for b in [name, f"{cores}C" if cores else "", f"{threads}T" if threads else "", f"{mhz}MHz" if mhz else ""] if b]
+        if bits:
+            lines.append(f"- CPU: {' '.join(str(x) for x in bits)}")
+
+    lines.append("")
+    lines.append("[Discos]")
+    if isinstance(drives, dict):
+        drives = [drives]
+    if isinstance(drives, list):
+        for d in drives:
+            if not isinstance(d, dict):
+                continue
+            name = str(d.get("Name") or "").strip()
+            try:
+                used = float(d.get("Used") or 0.0)
+                free = float(d.get("Free") or 0.0)
+            except Exception:
+                used = 0.0
+                free = 0.0
+            total = used + free
+            if name and total > 0:
+                lines.append(f"- {name}: libre {free/1024/1024/1024:.1f} GB / {total/1024/1024/1024:.1f} GB")
+    else:
+        lines.append("- No disponible")
+
+    lines.append("")
+    lines.append("[Top procesos (CPU acumulado)]")
+    if isinstance(procs, dict):
+        procs = [procs]
+    if isinstance(procs, list):
+        for p in procs:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("ProcessName") or "").strip()
+            pid = p.get("Id")
+            cpu = p.get("CPU")
+            ws = p.get("WorkingSet")
+            try:
+                ws_mb = float(ws or 0.0) / (1024.0 * 1024.0)
+            except Exception:
+                ws_mb = 0.0
+            if name:
+                lines.append(f"- {name} (pid={pid}) cpu={cpu} ws={ws_mb:.0f}MB")
+    else:
+        lines.append("- No disponible")
+
+    voice = "Listo. Hice un autodiagnostico del sistema y te deje el detalle en consola."
+    return SecurityAudit(voice=voice, detail="\n".join(lines).strip())
+
+
 def _copy_sqlite_db(src: Path) -> Optional[Path]:
     try:
         import shutil
