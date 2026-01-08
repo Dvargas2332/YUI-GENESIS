@@ -27,6 +27,13 @@ class MicMeter:
 
     def stop(self) -> None:
         self._stop.set()
+        t = self._thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        self._thread = None
 
     def _run(self) -> None:
         try:

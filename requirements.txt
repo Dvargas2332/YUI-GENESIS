@@ -13,3 +13,4 @@ pyautogui
 pillow
 websockets
 pygame
+pynput

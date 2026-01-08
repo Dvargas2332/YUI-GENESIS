@@ -35,7 +35,18 @@ Copyright (c) 2026 Diego Alonso Vargas Almengor
 - `YUI_STT_BACKEND=auto` (auto/speech_recognition/sounddevice/text)
 - `YUI_TTS_ENGINE=edge` y `YUI_TTS_VOICE=es-MX-DaliaNeural`
 - `YUI_DESKTOP_ENABLED=1` (comandos de escritorio; borrar/modificar requiere confirmación)
+- Seguridad: `YUI_SECURITY_GUARD=1` (URLs sospechosas y ejecutables requieren confirmación)
 - Entrada siempre activa: voz + texto. Di `no escuches` para apagar micrófono y `escucha` para reactivarlo.
+
+## Comandos de seguridad (rápidos)
+- `auditoria seguridad` (Defender + firewall)
+- `auditoria procesos` (procesos sospechosos, heurístico)
+- `auditoria puertos` (puertos en escucha + proceso)
+- `auditoria extensiones` (Chrome/Edge: permisos amplios, heurístico)
+- `auditoria cookies` (resumen de cookies, sin valores)
+- `analiza seguridad <texto>` (señales de SQLi/XSS/etc)
+- `escanea archivo RUTA` / `escanea carpeta RUTA` / `escanea descargas` (Windows Defender; no remediación automática)
+- `activa vigilancia` / `desactiva vigilancia` / `estado vigilancia` / `vigilancia intervalo 30` (monitoreo defensivo)
 
 ## Notas
 - No subas `.env` a git (hay `.gitignore`).

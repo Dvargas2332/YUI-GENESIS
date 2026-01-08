@@ -4,7 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 
 Role = Literal["system", "user", "assistant"]
@@ -88,6 +88,24 @@ class MemoryStore:
                     up_to_message_id INTEGER NOT NULL,
                     summary TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS preferences (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS macros (
+                    trigger TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -179,7 +197,7 @@ class MemoryStore:
         kind = (kind or "").strip().lower()
         label = (label or "").strip().lower()
         vector_json = (vector_json or "").strip()
-        if kind not in {"face", "hand"}:
+        if kind not in {"face", "hand", "screen"}:
             return
         if not label or not vector_json:
             return
@@ -194,7 +212,7 @@ class MemoryStore:
     def list_perception_examples(self, *, user_id: str, kind: str, limit: int = 200) -> List[tuple[str, str]]:
         user_id = (user_id or "default").strip()
         kind = (kind or "").strip().lower()
-        if kind not in {"face", "hand"}:
+        if kind not in {"face", "hand", "screen"}:
             return []
         with self._connect() as conn:
             rows = conn.execute(
@@ -229,6 +247,84 @@ class MemoryStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT name FROM desktop_tasks ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
         return [str(r[0]) for r in rows]
+
+    def set_preference(self, key: str, value: str) -> None:
+        key = (key or "").strip().lower()
+        value = (value or "").strip()
+        if not key:
+            return
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, value, updated_at),
+            )
+            conn.commit()
+
+    def get_preference(self, key: str) -> Optional[str]:
+        key = (key or "").strip().lower()
+        if not key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM preferences WHERE key=? LIMIT 1", (key,)).fetchone()
+        if not row:
+            return None
+        return str(row[0])
+
+    def delete_preference(self, key: str) -> None:
+        key = (key or "").strip().lower()
+        if not key:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM preferences WHERE key=?", (key,))
+            conn.commit()
+
+    def list_preferences(self, limit: int = 50) -> List[Tuple[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM preferences ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
+        out: List[Tuple[str, str]] = []
+        for r in rows:
+            out.append((str(r[0]), str(r[1])))
+        return out
+
+    def upsert_macro(self, *, trigger: str, action: str) -> None:
+        trigger = (trigger or "").strip().lower()
+        action = (action or "").strip()
+        if not trigger or not action:
+            return
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO macros (trigger, action, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(trigger) DO UPDATE SET action=excluded.action, updated_at=excluded.updated_at",
+                (trigger, action, updated_at),
+            )
+            conn.commit()
+
+    def get_macro(self, *, trigger: str) -> Optional[str]:
+        trigger = (trigger or "").strip().lower()
+        if not trigger:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT action FROM macros WHERE trigger=? LIMIT 1", (trigger,)).fetchone()
+        return str(row[0]) if row else None
+
+    def list_macros(self, limit: int = 50) -> List[Tuple[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT trigger, action FROM macros ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
+        out: List[Tuple[str, str]] = []
+        for r in rows:
+            out.append((str(r[0]), str(r[1])))
+        return out
+
+    def delete_macro(self, *, trigger: str) -> None:
+        trigger = (trigger or "").strip().lower()
+        if not trigger:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM macros WHERE trigger=?", (trigger,))
+            conn.commit()
 
     def delete_desktop_task(self, *, name: str) -> None:
         name = (name or "").strip().lower()

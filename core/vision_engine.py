@@ -234,6 +234,15 @@ class VisionEngine:
         handedness = None
         gesture_hits: List[str] = []
         hand_vec: Optional[List[float]] = None
+        hands: List[tuple[Optional[str], object]] = []
+        recognized_by_hand: List[bool] = []
+
+        # By default, only use heuristics when GestureRecognizer is unavailable (it tends to be noisy).
+        heur_env = (os.getenv("YUI_GESTURE_USE_HEURISTICS") or "").strip()
+        if heur_env:
+            use_heuristics = heur_env not in {"0", "false", "False"}
+        else:
+            use_heuristics = getattr(self, "_gesture", None) is None
 
         # Prefer MediaPipe GestureRecognizer (more accurate), fall back to HandLandmarker + heuristics.
         if getattr(self, "_gesture", None) is not None:
@@ -247,14 +256,18 @@ class VisionEngine:
                 handedness = getattr(res, "handedness", None)
                 top_gestures = getattr(res, "gestures", None)
                 min_score = float(os.getenv("YUI_GESTURE_MIN_SCORE", "0.55"))
+                min_score_thumbs = float(os.getenv("YUI_GESTURE_MIN_SCORE_THUMBS_UP", str(max(min_score, 0.85))))
                 if landmarks:
                     for idx, lm in enumerate(landmarks):
+                        if not self._hand_quality_ok(lm):
+                            continue
                         if hand_vec is None:
                             hand_vec = self._hand_vector(lm)
 
                         # GestureRecognizer returns a list of candidate gestures per hand.
+                        handed = self._handedness(handedness, idx)
+                        recognized_here = False
                         try:
-                            handed = self._handedness(handedness, idx)
                             state = self._finger_state(lm, handedness=handed)
                             cand = (top_gestures[idx] if top_gestures else None) or []
                             best = cand[0] if cand else None
@@ -262,14 +275,22 @@ class VisionEngine:
                             score = getattr(best, "score", None)
                             if name and (score is None or float(score) >= min_score):
                                 mapped = self._map_mp_gesture(str(name))
-                                if mapped == "thumbs_up" and not self._validate_thumbs_up(state):
-                                    mapped = None
+                                if mapped == "thumbs_up":
+                                    if score is not None and float(score) < min_score_thumbs:
+                                        mapped = None
+                                    elif not self._validate_thumbs_up_landmarks(lm, handedness=handed):
+                                        mapped = None
+                                    elif not self._validate_thumbs_up(state):
+                                        mapped = None
                                 if mapped:
                                     gesture_hits.append(mapped)
+                                    recognized_here = True
                                     if mapped == "open_palm" and self._detect_wave(lm[0]):
                                         gesture_hits.append("wave")
                         except Exception:
                             pass
+                        hands.append((handed, lm))
+                        recognized_by_hand.append(recognized_here)
 
         if not landmarks:
             try:
@@ -282,21 +303,39 @@ class VisionEngine:
 
         if not landmarks:
             self._reset_wave()
-            self._gesture_window.append(set())
+            self._clear_gesture_window()
             return [], False, None
 
-        # Heuristic fallback (also fills gaps when GestureRecognizer returns "None").
-        for idx, lm in enumerate(landmarks):
-            handed = self._handedness(handedness, idx)
-            state = self._finger_state(lm, handedness=handed)
-            heuristic = self._classify_gestures(lm, state)
-            for g in heuristic:
-                if g == "wave":
+        # If we didn't build hands from GestureRecognizer, build from HandLandmarker now.
+        if not hands:
+            for idx, lm in enumerate(landmarks):
+                if not self._hand_quality_ok(lm):
+                    continue
+                handed = self._handedness(handedness, idx)
+                hands.append((handed, lm))
+                recognized_by_hand.append(False)
+                if hand_vec is None:
+                    hand_vec = self._hand_vector(lm)
+
+        if not hands:
+            self._reset_wave()
+            self._clear_gesture_window()
+            return [], False, None
+
+        # Heuristic fallback: disabled by default when GestureRecognizer is available
+        # (it can be noisy and cause false positives like "thumbs_up").
+        if use_heuristics:
+            if len(recognized_by_hand) != len(hands):
+                recognized_by_hand = [False] * len(hands)
+            for (handed, lm), had_recognized in zip(hands, recognized_by_hand):
+                if had_recognized:
+                    continue
+                state = self._finger_state(lm, handedness=handed)
+                heuristic = self._classify_gestures(lm, state)
+                for g in heuristic:
+                    if g == "thumbs_up" and not self._validate_thumbs_up_landmarks(lm, handedness=handed):
+                        continue
                     gesture_hits.append(g)
-                else:
-                    gesture_hits.append(g)
-            if hand_vec is None:
-                hand_vec = self._hand_vector(lm)
 
         # Temporal smoothing (reduces flicker): keep gestures that persist across frames.
         wave_now = "wave" in gesture_hits
@@ -305,6 +344,39 @@ class VisionEngine:
             stable.append("wave")
 
         return stable, True, hand_vec
+
+    def _hand_quality_ok(self, lm) -> bool:
+        """
+        Extra guard to reduce false positives when MediaPipe hallucinates hands.
+        Uses the landmark bounding box area in normalized coords.
+        """
+        try:
+            xs = [float(p.x) for p in lm]
+            ys = [float(p.y) for p in lm]
+        except Exception:
+            return False
+
+        if not xs or not ys:
+            return False
+
+        # Reject clearly invalid normalized coords.
+        if any((x < -0.25 or x > 1.25) for x in xs) or any((y < -0.25 or y > 1.25) for y in ys):
+            return False
+
+        dx = (max(xs) - min(xs))
+        dy = (max(ys) - min(ys))
+        area = dx * dy
+
+        # Typical hand bbox area is ~0.03-0.20 depending on distance; noise tends to be tiny.
+        min_area = float(os.getenv("YUI_HAND_MIN_BBOX_AREA", "0.02"))
+        return area >= min_area
+
+    def _clear_gesture_window(self) -> None:
+        try:
+            self._gesture_window.clear()
+        except Exception:
+            # Fallback: recreate deque with same maxlen.
+            self._gesture_window = deque(maxlen=int(getattr(self._gesture_window, "maxlen", 4) or 4))
 
     def _smooth_gestures(self, gestures: List[str]) -> List[str]:
         stable_frames = int(self._gesture_window.maxlen or 1)
@@ -419,6 +491,41 @@ class VisionEngine:
             return False
         others = ["index", "middle", "ring", "pinky"]
         return all(not state.get(k, False) for k in others)
+
+    def _validate_thumbs_up_landmarks(self, lm, *, handedness: Optional[str]) -> bool:
+        """
+        Extra guard to reduce thumbs-up false positives.
+        Requires:
+        - Thumb tip clearly above wrist (relative to hand size).
+        - Other fingertips not extended up (tip not significantly above MCP).
+        """
+        try:
+            wrist = lm[0]
+            thumb_tip = lm[4]
+            thumb_ip = lm[3]
+            middle_mcp = lm[9]
+        except Exception:
+            return False
+
+        scale = self._dist2d(wrist, middle_mcp)
+        if scale <= 0:
+            scale = 0.2  # reasonable fallback in normalized coords
+
+        # Thumb must point "up" (smaller y). These ratios are conservative.
+        if float(thumb_tip.y) >= float(wrist.y) - (0.15 * scale):
+            return False
+        if float(thumb_tip.y) >= float(thumb_ip.y) - (0.08 * scale):
+            return False
+
+        # Other fingers should be folded: tip should not be clearly above MCP.
+        for tip_i, mcp_i in [(8, 5), (12, 9), (16, 13), (20, 17)]:
+            try:
+                if float(lm[tip_i].y) < float(lm[mcp_i].y) - (0.05 * scale):
+                    return False
+            except Exception:
+                return False
+
+        return True
 
     def _classify_gestures(self, lm, state: Dict[str, bool]) -> List[str]:
         gestures: List[str] = []

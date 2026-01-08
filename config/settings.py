@@ -67,6 +67,7 @@ class Settings:
     preview_width: int = field(default_factory=lambda: _env_int("YUI_PREVIEW_WIDTH", 480))
     preview_height: int = field(default_factory=lambda: _env_int("YUI_PREVIEW_HEIGHT", 270))
     mic_meter_enabled: bool = field(default_factory=lambda: _env_bool("YUI_MIC_METER_ENABLED", True))
+    mic_meter_pause_during_stt: bool = field(default_factory=lambda: _env_bool("YUI_MIC_METER_PAUSE_DURING_STT", True))
     perception_teach_cooldown_s: float = field(default_factory=lambda: _env_float("YUI_TEACH_COOLDOWN_S", 25.0))
     face_emotion_threshold: float = field(default_factory=lambda: _env_float("YUI_FACE_EMOTION_THRESHOLD", 0.55))
     hand_gesture_threshold: float = field(default_factory=lambda: _env_float("YUI_HAND_GESTURE_THRESHOLD", 0.55))
@@ -84,6 +85,12 @@ class Settings:
     wake_word: str = field(default_factory=lambda: _env_str("YUI_WAKE_WORD", "yui"))
     wake_listen_timeout_s: float = field(default_factory=lambda: _env_float("YUI_WAKE_LISTEN_TIMEOUT_S", 2.0))
     wake_phrase_time_limit_s: float = field(default_factory=lambda: _env_float("YUI_WAKE_PHRASE_TIME_LIMIT_S", 2.5))
+    wake_followup_s: float = field(default_factory=lambda: _env_float("YUI_WAKE_FOLLOWUP_S", 12.0))
+    wake_miss_to_hotmic: int = field(default_factory=lambda: _env_int("YUI_WAKE_MISS_TO_HOTMIC", 3))
+    wake_hotmic_s: float = field(default_factory=lambda: _env_float("YUI_WAKE_HOTMIC_S", 10.0))
+    debug_stt: bool = field(default_factory=lambda: _env_bool("YUI_DEBUG_STT", False))
+    sr_ambient_noise_s: float = field(default_factory=lambda: _env_float("YUI_SR_AMBIENT_NOISE_S", 0.15))
+    sr_calibrate_every_s: float = field(default_factory=lambda: _env_float("YUI_SR_CALIBRATE_EVERY_S", 45.0))
 
     # TTS (pyttsx3 is offline; gTTS fallback uses network)
     tts_rate: int = field(default_factory=lambda: _env_int("YUI_TTS_RATE", 165))
@@ -92,16 +99,23 @@ class Settings:
     tts_voice: str = field(default_factory=lambda: _env_str("YUI_TTS_VOICE", "es-MX-DaliaNeural"))
     tts_edge_rate: str = field(default_factory=lambda: _env_str("YUI_TTS_EDGE_RATE", "+0%"))
     tts_edge_volume: str = field(default_factory=lambda: _env_str("YUI_TTS_EDGE_VOLUME", "+0%"))
+    tts_edge_pitch: str = field(default_factory=lambda: _env_str("YUI_TTS_EDGE_PITCH", "+0Hz"))
+    # NOTE: edge-tts escapes SSML by design, so keep this off unless you switch engines.
+    tts_use_ssml: bool = field(default_factory=lambda: _env_bool("YUI_TTS_USE_SSML", False))
+    tts_contextual: bool = field(default_factory=lambda: _env_bool("YUI_TTS_CONTEXTUAL", True))
 
     # OpenAI-compatible chat endpoint (DeepSeek by default)
     llm_base_url: str = field(default_factory=lambda: _env_str("YUI_LLM_BASE_URL", _env_str("DEEPSEEK_BASE_URL", "https://api.deepseek.com")))
     llm_api_key: str = field(default_factory=lambda: _env_str("YUI_LLM_API_KEY", _env_str("DEEPSEEK_API_KEY", "")))
+    llm_mode: str = field(default_factory=lambda: _env_str("YUI_LLM_MODE", "auto"))  # auto|fast|deep
     llm_model: str = field(default_factory=lambda: _env_str("YUI_LLM_MODEL", "deepseek-chat"))  # default fast
     llm_model_fast: str = field(default_factory=lambda: _env_str("YUI_LLM_MODEL_FAST", _env_str("YUI_LLM_MODEL", "deepseek-chat")))
     llm_model_deep: str = field(default_factory=lambda: _env_str("YUI_LLM_MODEL_DEEP", "deepseek-reasoner"))
     llm_timeout_s: float = field(default_factory=lambda: _env_float("YUI_LLM_TIMEOUT_S", 30.0))
     llm_temperature: float = field(default_factory=lambda: _env_float("YUI_LLM_TEMPERATURE", 0.4))
     llm_deep_temperature: float = field(default_factory=lambda: _env_float("YUI_LLM_DEEP_TEMPERATURE", 0.2))
+    llm_max_tokens: int = field(default_factory=lambda: _env_int("YUI_LLM_MAX_TOKENS", 240))
+    strip_stage_directions: bool = field(default_factory=lambda: _env_bool("YUI_STRIP_STAGE_DIRECTIONS", True))
 
     # Memory
     memory_db_path: Path = field(default_factory=lambda: _env_path("YUI_MEMORY_DB_PATH", PROJECT_ROOT / "data" / "user_data.db"))
@@ -112,3 +126,7 @@ class Settings:
     memory_use_long_term: bool = field(default_factory=lambda: _env_bool("YUI_MEMORY_USE_LONG_TERM", True))
     memory_retrieve_k: int = field(default_factory=lambda: _env_int("YUI_MEMORY_RETRIEVE_K", 6))
     memory_extract_every_n_turns: int = field(default_factory=lambda: _env_int("YUI_MEMORY_EXTRACT_EVERY_N", 8))
+    memory_min_query_tokens: int = field(default_factory=lambda: _env_int("YUI_MEMORY_MIN_QUERY_TOKENS", 3))
+    memory_min_score: float = field(default_factory=lambda: _env_float("YUI_MEMORY_MIN_SCORE", 0.12))
+    debug_memory: bool = field(default_factory=lambda: _env_bool("YUI_DEBUG_MEMORY", False))
+    memory_async: bool = field(default_factory=lambda: _env_bool("YUI_MEMORY_ASYNC", True))

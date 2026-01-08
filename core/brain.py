@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from queue import Queue
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from requests import HTTPError
@@ -14,16 +16,27 @@ from core.memory import MemoryStore
 
 SYSTEM_PROMPT = """
 Eres YUI, una asistente de voz con visión (cámara) y memoria.
-Tu objetivo es sentirte viva: cálida, reactiva, curiosa y natural.
+Objetivo: sonar viva (cálida, reactiva, curiosa) y ser útil.
 
-Reglas:
+Ciberseguridad (defensiva):
+- Eres experta en ciberseguridad defensiva: detectar riesgos, malas prácticas, malware y phishing (conceptual).
+- Puedes ayudar a revisar código/configuraciones y a responder ante incidentes con pasos seguros.
+- Conoces herramientas y marcos como Nmap, Wireshark, Burp Suite, OWASP Top 10 y MITRE ATT&CK, siempre con enfoque de auditoría autorizada y defensa.
+- No das instrucciones para hackear, explotar vulnerabilidades, evadir defensas, crear malware o robar información.
+  Si te piden eso, rechaza y ofrece alternativas seguras.
+
+Reglas de conversación:
 - Responde en español.
 - Mantén respuestas breves por voz (1–3 frases) salvo que te pidan detalle.
+- Escribe como conversación hablada: evita Markdown/código y listas largas; usa puntuación natural para pausas.
 - Si hay un usuario identificado por rostro, úsalo por su nombre de forma natural.
-- Si detectas un gesto, intégralo (p. ej. “vi tu mano levantada”).
+- Si hay gestos o emoción detectados, úsalos solo como contexto para ajustar el tono y las palabras.
+- No menciones gestos/sonrisas/emociones a menos que el usuario lo pida explícitamente (por ejemplo: "¿me ves?", "¿qué gesto hice?", "¿cómo me veo?").
 - Si falta info, haz 1 pregunta corta.
 - No inventes acciones en el mundo real; ofrece pasos concretos.
-- Usa recuerdos como contexto implícito: no digas “según mi memoria”, “por lo que recuerdo” ni “recuerdo que…”, solo úsalo.
+- No escribas acotaciones teatrales ni acciones entre asteriscos/corchetes/paréntesis. Evita cosas como: *asiente*, *sonríe*, (se ríe), [mira la cámara]. Escribe solo lo que dirías en voz alta.
+- Usa recuerdos como contexto implícito: no menciones “memoria” ni que “recuerdas/te acuerdas” (ej. “ahora lo recuerdo”, “lo recuerdo”, “me acuerdo”). Solo usa la info con naturalidad.
+- Si el usuario te acaba de decir un dato, no actúes como si ya lo supieras: acéptalo y sigue la conversación.
 """.strip()
 
 
@@ -40,11 +53,22 @@ class Brain:
         self.settings = settings
         self.memory = memory
         self.last_mode: str = "fast"
+        self._postprocess_lock = threading.Lock()
+        self._postprocess_scheduled = False
+        self._postprocess_q: Queue[Optional[str]] = Queue()
+        if self.settings.memory_async:
+            threading.Thread(target=self._postprocess_worker, daemon=True).start()
 
     def route(self, user_text: str) -> Tuple[str, float, str]:
         """
         Decide si usar modelo rápido o profundo.
         """
+        override = (getattr(self.settings, "llm_mode", "") or "").strip().lower()
+        if override in {"deep", "profundo"}:
+            return self.settings.llm_model_deep, float(self.settings.llm_deep_temperature), "deep"
+        if override in {"fast", "rápido", "rapido"}:
+            return self.settings.llm_model_fast, float(self.settings.llm_temperature), "fast"
+
         t = (user_text or "").strip().lower()
         if not t:
             return self.settings.llm_model_fast, float(self.settings.llm_temperature), "fast"
@@ -109,6 +133,8 @@ class Brain:
         llm_model: Optional[str] = None,
         llm_temperature: Optional[float] = None,
         llm_mode: Optional[str] = None,
+        extra_system_prompt: Optional[str] = None,
+        postprocess: Optional[Callable[[str], str]] = None,
     ) -> str:
         user_text = (user_text or "").strip()
         if not user_text:
@@ -130,11 +156,20 @@ class Brain:
         self.last_mode = str(llm_mode or "fast")
 
         messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if extra_system_prompt:
+            messages.append({"role": "system", "content": str(extra_system_prompt).strip()})
 
         # Recuerdos relevantes (memoria larga, natural)
-        if self.settings.memory_use_long_term and self.settings.memory_retrieve_k > 0:
+        if self.settings.memory_use_long_term and self.settings.memory_retrieve_k > 0 and self._should_retrieve_long_term(user_text):
             memories = self._retrieve_relevant_memories(user_id=user_id, query=user_text, k=self.settings.memory_retrieve_k)
             if memories:
+                if self.settings.debug_memory:
+                    try:
+                        print(f"[YUI] Memories injected ids={memories['ids']}")
+                        for c in memories["contents"]:
+                            print(f"[YUI]  - {c}")
+                    except Exception:
+                        pass
                 memories_text = "\n".join([f"- {m}" for m in memories["contents"]])
                 messages.append(
                     {
@@ -187,12 +222,49 @@ class Brain:
 
         response = (response or "").strip()
         if not response:
-            response = "Te escucho. ¿Qué necesitas?"
+            response = "¿Qué necesitas?"
+
+        response = self._sanitize_spoken_text(response, user_text=user_text)
+        if postprocess is not None:
+            try:
+                response = (postprocess(response) or "").strip()
+            except Exception:
+                response = (response or "").strip()
+        if not response:
+            response = "¿Qué necesitas?"
 
         self.memory.add("assistant", response)
-        self._maybe_summarize()
-        self._maybe_extract_memories(user_id=user_id)
+        if self.settings.memory_async:
+            self._schedule_postprocess(user_id=user_id)
+        else:
+            self._maybe_summarize()
+            self._maybe_extract_memories(user_id=user_id)
         return response
+
+    def _schedule_postprocess(self, *, user_id: str) -> None:
+        with self._postprocess_lock:
+            if self._postprocess_scheduled:
+                return
+            self._postprocess_scheduled = True
+        self._postprocess_q.put((user_id or "default").strip())
+
+    def _postprocess_worker(self) -> None:
+        while True:
+            user_id = self._postprocess_q.get()
+            try:
+                if user_id is None:
+                    return
+                self._maybe_summarize()
+                self._maybe_extract_memories(user_id=str(user_id))
+            except Exception as e:
+                print(f"[YUI] Postprocess error: {type(e).__name__}: {e}")
+            finally:
+                with self._postprocess_lock:
+                    self._postprocess_scheduled = False
+                try:
+                    self._postprocess_q.task_done()
+                except Exception:
+                    pass
 
     def _retrieve_relevant_memories(self, *, user_id: str, query: str, k: int) -> Optional[dict]:
         """
@@ -208,13 +280,17 @@ class Brain:
             return None
 
         scored: List[tuple[float, int, str]] = []
+        min_score = float(self.settings.memory_min_score or 0.0)
         for mid, content, salience, _tags in candidates:
             c = self._tokenize(content)
             if not c:
                 continue
-            overlap = len(q.intersection(c)) / max(1, len(q))
+            overlap_count = len(q.intersection(c))
+            if overlap_count <= 0:
+                continue
+            overlap = overlap_count / max(1, len(q))
             score = overlap * 0.75 + float(salience) * 0.25
-            if score > 0.05:
+            if score >= min_score:
                 scored.append((score, mid, content))
 
         scored.sort(key=lambda t: t[0], reverse=True)
@@ -229,8 +305,188 @@ class Brain:
         text = re.sub(r"[^a-záéíóúüñ0-9\s]+", " ", text)
         parts = [p for p in text.split() if len(p) >= 3]
         # stopwords mínimas
-        stop = {"que", "para", "por", "con", "una", "uno", "los", "las", "del", "como", "pero", "porque", "esto", "eso"}
+        stop = {
+            "que",
+            "para",
+            "por",
+            "con",
+            "una",
+            "uno",
+            "los",
+            "las",
+            "del",
+            "como",
+            "pero",
+            "porque",
+            "esto",
+            "eso",
+            "hola",
+            "buenas",
+            "buenos",
+            "dias",
+            "tardes",
+            "noches",
+            "gracias",
+            "ok",
+            "vale",
+            "yui",
+        }
         return {p for p in parts if p not in stop}
+
+    def _should_retrieve_long_term(self, user_text: str) -> bool:
+        """
+        Avoid injecting long-term memory for very short/low-signal utterances (reduces incoherence).
+        """
+        t = (user_text or "").strip().lower()
+        if not t:
+            return False
+
+        # If user explicitly asks to remember/recall, allow retrieval even if short.
+        recall_triggers = [
+            "recuerda",
+            "recuerdas",
+            "acuérdate",
+            "acuerdate",
+            "te acuerdas",
+            "te acuerdas de",
+            "qué dijimos",
+            "que dijimos",
+            "lo que hablamos",
+            "antes",
+            "la otra vez",
+            "ayer",
+            "mi nombre",
+            "cómo me llamo",
+            "como me llamo",
+        ]
+        if any(x in t for x in recall_triggers):
+            return True
+
+        tokens = self._tokenize(user_text)
+        return len(tokens) >= int(self.settings.memory_min_query_tokens or 0)
+
+    def _sanitize_spoken_text(self, text: str, *, user_text: str | None = None) -> str:
+        """
+        Make the assistant output sound natural when spoken:
+        - Strip roleplay/stage directions like "*asiente*", "(sonríe)".
+        """
+        if not self.settings.strip_stage_directions:
+            return (text or "").strip()
+
+        out = (text or "")
+
+        # Drop an accidental "YUI:" prefix.
+        out = re.sub(r"^\s*yui\s*:\s*", "", out, flags=re.IGNORECASE)
+
+        # Remove SSML/XML tags if the model ever emits them.
+        out = re.sub(r"</?speak\b[^>]*>", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"</?prosody\b[^>]*>", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"<break\b[^>]*>", " ", out, flags=re.IGNORECASE)
+
+        # Remove stage directions wrapped in asterisks.
+        out = re.sub(r"\*\s*[^\*\n]{1,80}\s*\*", " ", out)
+
+        # If the model starts with a narrated gesture (common), drop that leading sentence.
+        out = re.sub(
+            r"^(?:yo\s+)?(?:asiento|sonr[ií]o|suspiro|me\s+r[ií]o|niego)\b[^\n]{0,60}?[.!?]+\s*",
+            "",
+            out,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove meta-memory phrasing (sounds incoherent in voice).
+        out = re.sub(r"\bseg[uú]n\s+mi\s+memoria\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bpor\s+lo\s+que\s+recuerdo\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\b(?:ahora|ya)\s+(?:lo\s+)?recuerdo\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\blo\s+recuerdo\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bme\s+acuerdo(?:\s+de)?\b", " ", out, flags=re.IGNORECASE)
+        out = re.sub(r"\brecuerdo\s+que\b", " ", out, flags=re.IGNORECASE)
+
+        # Remove short bracket/parenthesis stage directions when they look like actions.
+        stage_words = [
+            "asiente",
+            "sonríe",
+            "sonrie",
+            "ríe",
+            "rie",
+            "se ríe",
+            "se rie",
+            "suspira",
+            "mira",
+            "parpadea",
+            "guiña",
+            "inclina",
+            "niega",
+        ]
+
+        # Handle a common pattern: a leading stage direction with a single '*' (unbalanced).
+        def _strip_leading_star_action(m: re.Match) -> str:
+            inner = (m.group(1) or "").strip().lower()
+            if any(w in inner for w in stage_words):
+                return ""
+            return m.group(0)
+
+        out = re.sub(r"^\s*\*\s*([^\n]{1,60}?)(?:\s*[.!?]+\s+)", _strip_leading_star_action, out)
+
+        def _strip_action(m: re.Match) -> str:
+            inner = (m.group(1) or "").strip().lower()
+            if any(w in inner for w in stage_words):
+                return " "
+            return m.group(0)
+
+        out = re.sub(r"\(\s*([^\)\n]{1,60})\s*\)", _strip_action, out)
+        out = re.sub(r"\[\s*([^\]\n]{1,60})\s*\]", _strip_action, out)
+
+        # If the user didn't ask about vision/perception, strip unprompted mentions like
+        # "Veo tu pulgar arriba..." to avoid being noisy.
+        if user_text and not self._user_wants_perception_feedback(user_text):
+            out = re.sub(
+                r"^(?:yo\s+)?(?:vi|veo|te\s+veo|te\s+estoy\s+viendo|not[ée]|detect[ée])\b[^\n]{0,90}?"
+                r"\b(?:gesto|mano|pulgar|sonrisa|c[aá]mara|cara|expresi[óo]n|emoci[óo]n)\b"
+                r"[^\n]{0,90}?[.!?]+\s*",
+                "",
+                out,
+                flags=re.IGNORECASE,
+            )
+
+        # Cleanup spacing/punctuation artifacts.
+        out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+        out = re.sub(r"\.\.\.\s*\.", "...", out)
+        out = re.sub(r"\.\s+\.", ".", out)
+        out = re.sub(r"\s{2,}", " ", out).strip()
+        return out
+
+
+    def _user_wants_perception_feedback(self, user_text: str) -> bool:
+        t = (user_text or "").strip().lower()
+        if not t:
+            return False
+        keys = [
+            "me ves",
+            "puedes verme",
+            "ves",
+            "cámara",
+            "camara",
+            "qué ves",
+            "que ves",
+            "gesto",
+            "mano",
+            "pulgar",
+            "sonrisa",
+            "sonriendo",
+            "cara",
+            "expresión",
+            "expresion",
+            "emoción",
+            "emocion",
+            "cómo me veo",
+            "como me veo",
+            "estoy enoj",
+            "estoy feliz",
+            "estoy triste",
+            "angust",
+        ]
+        return any(k in t for k in keys)
 
     def _maybe_extract_memories(self, *, user_id: str) -> None:
         """
@@ -321,6 +577,20 @@ class Brain:
                 self.memory.upsert_fact("name", name)
                 return
 
+        if "mi nombre es" in low:
+            idx = low.find("mi nombre es")
+            name = t[idx + len("mi nombre es") :].strip(" .:;!")
+            if name:
+                self.memory.upsert_fact("name", name)
+                return
+
+        if "me dicen" in low:
+            idx = low.find("me dicen")
+            name = t[idx + len("me dicen") :].strip(" .:;!")
+            if name:
+                self.memory.upsert_fact("name", name)
+                return
+
         if low.startswith("recuerda que "):
             rest = t[len("recuerda que ") :].strip()
             # Si viene con "mi X es Y"
@@ -384,7 +654,7 @@ class Brain:
             parts.append(f"Gestos detectados: {', '.join(visual.gestures)}.")
         if visual.face_emotion:
             parts.append(f"Emoción facial probable: {visual.face_emotion}.")
-        return "Contexto visual actual: " + " ".join(parts)
+        return "Contexto visual actual (úsalo solo para adaptar tu respuesta; no lo narres literalmente): " + " ".join(parts)
 
     def _chat(self, messages: List[Dict[str, str]], *, model: str, temperature: float) -> str:
         # Prefer OpenAI SDK (works with DeepSeek's OpenAI-compatible API).
@@ -401,25 +671,25 @@ class Brain:
         # DeepSeek docs often use base_url="https://api.deepseek.com".
         # Some providers require "/v1" explicitly; we retry with /v1 if needed.
         client = OpenAI(api_key=self.settings.llm_api_key, base_url=base, timeout=self.settings.llm_timeout_s)
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "temperature": float(temperature),
+        }
+        max_tokens = int(getattr(self.settings, "llm_max_tokens", 0) or 0)
+        if max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
+
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=False,
-                temperature=float(temperature),
-            )
+            resp = client.chat.completions.create(**kwargs)
         except Exception as e:
             print(f"[YUI] LLM OpenAI-SDK error (base_url={base!r}): {type(e).__name__}: {e}")
             # Retry with /v1 appended (covers providers that don't auto-prefix).
             base_v1 = base if base.endswith("/v1") else f"{base}/v1"
             if base_v1 != base:
                 client = OpenAI(api_key=self.settings.llm_api_key, base_url=base_v1, timeout=self.settings.llm_timeout_s)
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    stream=False,
-                    temperature=float(temperature),
-                )
+                resp = client.chat.completions.create(**kwargs)
             else:
                 raise e
 
@@ -436,6 +706,9 @@ class Brain:
             "messages": messages,
             "temperature": float(temperature),
         }
+        max_tokens = int(getattr(self.settings, "llm_max_tokens", 0) or 0)
+        if max_tokens > 0:
+            payload["max_tokens"] = max_tokens
         headers = {"Authorization": f"Bearer {self.settings.llm_api_key}", "Content-Type": "application/json"}
 
         resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.settings.llm_timeout_s)
@@ -455,4 +728,4 @@ class Brain:
             return "De nada. ¿Seguimos?"
 
         prefix = f"{name}, " if name else ""
-        return f"{prefix}te escucho. Dime qué necesitas."
+        return f"{prefix}¿Qué necesitas?"
